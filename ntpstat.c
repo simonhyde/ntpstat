@@ -11,6 +11,7 @@
 #include <arpa/inet.h>
 #include <sys/time.h>
 #include <error.h>
+#include "ntpstat.h"
 #define NTP_PORT  123
 
 /* This program uses an NTP mode 6 control message, which is the
@@ -41,16 +42,35 @@
 #define PAYLOADSIZE 468 /* size in bytes of the message payload string */
 /*-------------------------------------------------------------------------*/
 
+
 void die (char *msg) {
   fprintf (stderr,"%s\n",msg);
   exit (2);
 }
+
+int                   sd;        /* file descriptor for socket */
+struct sockaddr_in    sock;
+void init_ntp_state()
+{
 /*-------------------------------------------------------------------------*/
-int main (void) {
-  int                   rc;        //  return code
-  struct sockaddr_in    sock;
   struct in_addr        address;
-  int                   sd;        /* file descriptor for socket */
+  inet_aton("127.0.0.1", &address);
+  sock.sin_family = AF_INET;
+  sock.sin_addr = address;
+  sock.sin_port = htons(NTP_PORT);
+
+  /*---------------------------------------------------------------------*/
+  if ((sd = socket (PF_INET, SOCK_DGRAM, 0)) < 0)
+    die("unable to open socket");
+
+  if (connect(sd, (struct sockaddr *)&sock, sizeof(sock)) < 0) {
+    perror ("On connect");
+    die("unable to connect to socket");
+  }
+}
+
+int get_ntp_state (ntpstate_t * data) {
+  int			rc;
   fd_set                fds;
   struct timeval        tv;
   int                   n;         /* number returned from select call */
@@ -95,6 +115,12 @@ int main (void) {
   const char STRATUM[] = "stratum=";
   const char POLL[] = "tc=";
   const char REFID[] = "refid=";
+  /*----------------------------------------------------------------*/
+  /* Compose the command message */
+
+  memset ( &ntpmsg, 0, sizeof(ntpmsg));
+  ntpmsg.byte1 = B1VAL;
+  ntpmsg.byte2 = B2VAL;  ntpmsg.sequence=htons(1);
 
   /* initialise timeout value */
   tv.tv_sec = 1;
@@ -103,44 +129,28 @@ int main (void) {
   /* initialise file descriptor set */
   FD_ZERO(&fds);
 
-  inet_aton("127.0.0.1", &address);
-  sock.sin_family = AF_INET;
-  sock.sin_addr = address;
-  sock.sin_port = htons(NTP_PORT);
-
-  /*----------------------------------------------------------------*/
-  /* Compose the command message */
-
-  memset ( &ntpmsg, 0, sizeof(ntpmsg));
-  ntpmsg.byte1 = B1VAL;
-  ntpmsg.byte2 = B2VAL;  ntpmsg.sequence=htons(1);
-  /*---------------------------------------------------------------------*/
-  /* Send the command message */
-  if ((sd = socket (PF_INET, SOCK_DGRAM, 0)) < 0)
-    die("unable to open socket");
-
-  if (connect(sd, (struct sockaddr *)&sock, sizeof(sock)) < 0) {
-    perror ("On connect");
-    die("unable to connect to socket");
-  }
   FD_SET(sd, &fds);
 
+  /* Send the command message */
   if (send(sd, &ntpmsg, sizeof(ntpmsg), 0) < 0) {
-    perror ("On send");
-    die ("unable to send command to NTP port");
+    data->status = 2;
+    return 2;
   }
   /*----------------------------------------------------------------------*/
   /* Receive the reply message */
   n = select (sd+1, &fds, (fd_set *)0, (fd_set *)0 , &tv);
 
   if (n == 0)
-    die ("timeout");
+    //Timeout
+    return data->status = 2;
 
   if (n == -1)
-    die ("error on select");
+    //Error on select
+    return data->status = 2;
 
   if ((n = recv (sd, &ntpmsg, sizeof(ntpmsg), 0)) < 0)
-    die ("Unable to talk to NTP daemon. Is it running?");
+    //Invalid data back!
+    return data->status = 2;
 
   /*----------------------------------------------------------------------*/
   /* Interpret the received NTP control message */
@@ -155,60 +165,28 @@ int main (void) {
   byte1ok = ((ntpmsg.byte1&0x3F) == B1VAL);
   byte2ok = ((ntpmsg.byte2 & ~MMASK) == (B2VAL|RMASK));
   if (!(byte1ok && byte2ok)) {
-    fprintf (stderr,"status word is 0x%02x%02x\n", ntpmsg.byte1,ntpmsg.byte2 );
-    die ("return data appears to be invalid based on status word");
+    //Invalid data!
+    return data->status = 2;
   }
 
   if (!(ntpmsg.byte2 | EMASK)) {
-    fprintf (stderr,"status byte2 is %02x\n", ntpmsg.byte2 );
-    die ("error bit is set in reply");
+    return data->status = 2;
+    //Error bit is set!
   }
 
   if (!(ntpmsg.byte2 | MMASK)) {
-    fprintf (stderr,"status byte2 is %02x\n", ntpmsg.byte2 );
-    fprintf (stderr,"More bit unexpected in reply");
+    return data->status = 2;
+    //Invalid data->.
   }
 
   /* if the leap indicator (LI), which is the two most significant bits
      in status byte1, are both one, then the clock is not synchronised. */
   if ((ntpmsg.status1 >> 6) == 3) {
-    printf ("unsynchronised\n");
-
-    /* look at the system event code and see if indicates system restart */
-    if ((ntpmsg.status2 & 0x0F) == 1)
-      printf ("  time server re-starting\n");
-      rc=1;
+    rc=1;
   }
   else {
     rc=0;
-    printf ("synchronised to ");
 
-    clksrc = (ntpmsg.status1 & 0x3F);
-    if (clksrc < 10)
-      printf("%s", clksrcname[clksrc]);
-    else
-      printf("unknown source");
-
-    if (clksrc == 6) {
-      // source of sync is another NTP server so check the IP address
-      strncpy(buff, ntpmsg.payload, sizeof(buff));
-      if ((newstr = strstr (buff, REFID))) {
-	newstr += sizeof(REFID) - 1;
-	dispstr = strtok(newstr,",");
-
-	/* Check the resultant string is of a reasonable length */
-	if ((strlen (dispstr) == 0) || (strlen (dispstr) > 16)) {
-	  printf (" <IP unreadable>");
-	}
-	else {
-	  printf(" (%s)",dispstr);
-	}
-      } else {
-	rc=1;
-	printf (" <IP unknown>");
-      }
-
-    }
     /* the message payload is an ascii string like
        version="ntpd 4.0.99k Thu Apr  5 14:21:47 EDT 2001 (1)",
        processor="i686", system="Linux2.4.2-2", leap=0, stratum=3,
@@ -225,13 +203,13 @@ int main (void) {
       /* Check the resultant string is of a reasonable length */
       if ((strlen (dispstr) == 0) || (strlen (dispstr) > 2)) {
 	printf (", stratum unreadable\n");
+	data->stratum = -1;
       }
       else {
-	printf(" at stratum %s \n",dispstr);
+	data->stratum = atoi(dispstr);
       }
     } else {
       rc=1;
-      printf (", stratum unknown\n");
     }
 
     /* Set the position of the start of the string to
@@ -246,14 +224,14 @@ int main (void) {
       /* Check the resultant string is of a reasonable length */
       if ((strlen (dispstr) == 0) || (strlen (dispstr) > 10) ||
 	      (strlen (delaystr) == 0) || (strlen (delaystr) > 10)) {
-	printf ("accuracy unreadable\n");
+	data->accuracy = -1;
       }
       else {
-	printf("   time correct to within %.0f ms\n", atof(dispstr) + atof(delaystr) / 2.0);
+	data->accuracy = atof(dispstr) + atof(delaystr) / 2.0;
       }
     } else {
       rc=1;
-      printf ("accuracy unknown\n");
+      data->accuracy = -1;
     }
   }
 
@@ -264,15 +242,15 @@ int main (void) {
 
     /* Check the resultant string is of a reasonable length */
     if ((strlen (dispstr) == 0) || (strlen (dispstr) > 2)) {
-      printf ("poll interval unreadable\n");
+      data->interval = -1;
     }
     else {
-      printf("   polling server every %d s\n",1 << atoi(dispstr));
+      data->interval = 1 << atoi(dispstr);
     }
   } else {
     rc=1;
-    printf ("poll interval unknown\n");
+    data->interval = -1;
   }
 
-  return rc;
+  return data->status = rc;
 }
