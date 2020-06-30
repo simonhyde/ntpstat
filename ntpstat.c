@@ -187,6 +187,11 @@ int get_ntp_state (ntpstate_t * data) {
   else {
     rc=0;
 
+    /* If unspecified/unknown then that's probably an error (all our servers have gone away) */
+    clksrc = (ntpmsg.status1 & 0x3F);
+    if (clksrc == 0)
+	rc=3;
+
     /* the message payload is an ascii string like
        version="ntpd 4.0.99k Thu Apr  5 14:21:47 EDT 2001 (1)",
        processor="i686", system="Linux2.4.2-2", leap=0, stratum=3,
